@@ -25,7 +25,7 @@ from telegram.error import TelegramError
 # CONFIGURATION SECTION
 # ==========================================
 # Naya Bot Token
-BOT_TOKEN = "8273026626:AAFIcN-Esy0ZUnFr29LSiEDlrYAcnvKqnHg"
+BOT_TOKEN = "8683291034:AAEW0PAFMWpFrP-cbjFCBFm8Q2_zABv7Wds"
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
