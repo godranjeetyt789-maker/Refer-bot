@@ -1,1447 +1,1156 @@
 import os
 import sqlite3
-import threading
-import time
 import asyncio
 import logging
-import requests
 from datetime import datetime, timedelta
 from functools import wraps
 
-# Flask imports
-from flask import Flask, request, session, redirect, url_for, render_template_string
-from jinja2 import Environment, DictLoader
-from werkzeug.middleware.proxy_fix import ProxyFix  # Render HTTPS Proxy Fix
-
-# Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, TypeHandler, ApplicationHandlerStop
+    filters, ContextTypes, ConversationHandler
 )
 from telegram.error import TelegramError
 
 # ==========================================
-# CONFIGURATION SECTION
+# CONFIGURATION
 # ==========================================
-# Naya Bot Token
-BOT_TOKEN = "8683291034:AAEW0PAFMWpFrP-cbjFCBFm8Q2_zABv7Wds"
+BOT_TOKEN = "8273026626:AAFIcN-Esy0ZUnFr29LSiEDlrYAcnvKqnHg"
+ADMIN_IDS = [6106058051]  # Multiple admins support
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123"
-ADMIN_TELEGRAM_ID = "6106058051"
-
-DEFAULT_REFERRAL_REWARD = 10
-DEFAULT_DAILY_BONUS = 5
-DEFAULT_MIN_WITHDRAW = 100
-
-# RENDER FIX: Allow dynamic database path and PORT
 DB_FILE = os.environ.get("DB_FILE", "bot_database.db")
-FLASK_PORT = int(os.environ.get("PORT", 5000))
+PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Constants for conversation states
+WITHDRAW_AMOUNT, WITHDRAW_METHOD, WITHDRAW_BANK_NAME, WITHDRAW_ACCOUNT_NO, WITHDRAW_IFSC, WITHDRAW_HOLDER, WITHDRAW_UPI, WITHDRAW_CRYPTO = range(8)
+ADMIN_BROADCAST, ADMIN_ADD_TASK, ADMIN_ADD_CHANNEL, ADMIN_SET_REWARD, ADMIN_SET_DAILY, ADMIN_SET_MINWITHDRAW = range(6)
+
 # ==========================================
-# DATABASE SYSTEM
+# DATABASE
 # ==========================================
-def get_db_connection():
-    # timeout=20 added so it doesn't lock when bot & admin access concurrently
+def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=20)
     conn.row_factory = sqlite3.Row
     return conn
 
-def query_db(query, args=(), one=False, commit=False):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(query, args)
-    rv = cur.fetchall()
-    if commit:
-        conn.commit()
-    last_id = cur.lastrowid
-    conn.close()
-    return last_id if commit else (rv[0] if rv else None) if one else rv
-
 def init_db():
-    queries =[
-        """CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT UNIQUE, username TEXT, 
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_referrals INT DEFAULT 0, 
-            successful_referrals INT DEFAULT 0, balance FLOAT DEFAULT 0.0, 
-            is_blocked BOOLEAN DEFAULT 0, last_bonus TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id BIGINT, referred_id BIGINT UNIQUE, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT, reward FLOAT, link TEXT, is_active BOOLEAN DEFAULT 1
-        )""",
-        """CREATE TABLE IF NOT EXISTS user_tasks (
-            user_id BIGINT, task_id INTEGER, completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id, task_id)
-        )""",
-        """CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT, channel_link TEXT, channel_id TEXT, is_active BOOLEAN DEFAULT 1
-        )""",
-        """CREATE TABLE IF NOT EXISTS withdraw_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT, amount FLOAT, method TEXT, details TEXT, status TEXT DEFAULT 'Pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS broadcast_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT, status TEXT DEFAULT 'Pending'
-        )""",
-        """CREATE TABLE IF NOT EXISTS admin (
-            username TEXT PRIMARY KEY, password TEXT
-        )"""
-    ]
-    for q in queries: query_db(q, commit=True)
-
-    if not query_db("SELECT * FROM admin", one=True):
-        query_db("INSERT INTO admin (username, password) VALUES (?, ?)", (ADMIN_USERNAME, ADMIN_PASSWORD), commit=True)
+    conn = get_db()
+    c = conn.cursor()
     
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        total_referrals INTEGER DEFAULT 0,
+        balance REAL DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
+        last_bonus TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER UNIQUE,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        description TEXT,
+        reward REAL,
+        link TEXT,
+        is_active INTEGER DEFAULT 1
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS user_tasks (
+        user_id INTEGER,
+        task_id INTEGER,
+        completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, task_id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        link TEXT,
+        chat_id TEXT,
+        is_active INTEGER DEFAULT 1
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        method TEXT,
+        details TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    
+    # Default settings
     defaults = {
-        'referral_reward': str(DEFAULT_REFERRAL_REWARD),
-        'daily_bonus': str(DEFAULT_DAILY_BONUS),
-        'min_withdraw': str(DEFAULT_MIN_WITHDRAW),
-        'welcome_message': "Welcome to the Earn Bot! Use the menu below.",
-        'force_join': "1",
-        'bot_token': BOT_TOKEN
+        'referral_reward': '10',
+        'daily_bonus': '5',
+        'min_withdraw': '100',
+        'welcome_message': 'Welcome to Earn Bot! Invite friends and complete tasks to earn coins.',
+        'force_join': '1'
     }
-    for k, v in defaults.items():
-        if not query_db("SELECT * FROM settings WHERE key=?", (k,), one=True):
-            query_db("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v), commit=True)
-
-    current_db_token = query_db("SELECT value FROM settings WHERE key='bot_token'", one=True)
-    if current_db_token and current_db_token['value'] == "8440702378:AAFWNjRA5ry4cx3MF8WsYIPtgAj4I69xcuA":
-        query_db("UPDATE settings SET value=? WHERE key='bot_token'", (BOT_TOKEN,), commit=True)
-
-    try:
-        query_db("ALTER TABLE users ADD COLUMN last_bonus TIMESTAMP", commit=True)
-    except sqlite3.OperationalError:
-        pass
-
-def get_setting(key, default_type=str):
-    res = query_db("SELECT value FROM settings WHERE key=?", (key,), one=True)
-    if res:
-        if default_type == int: return int(float(res['value']))
-        if default_type == float: return float(res['value'])
-        return res['value']
-    return default_type()
-
-def set_setting(key, value):
-    query_db("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)), commit=True)
+    
+    for key, value in defaults.items():
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    
+    conn.commit()
+    conn.close()
 
 init_db()
 
 # ==========================================
-# ADMIN PANEL EMBEDDED TEMPLATES
+# HELPER FUNCTIONS
 # ==========================================
-HTML_TEMPLATES = {
-    'base.html': """
-    <!DOCTYPE html>
-    <html lang="en" class="dark">
-    <head>
-        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Admin Dashboard</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <script>tailwind.config = { darkMode: 'class', theme: { extend: { colors: { gray: { 850: '#1f2937', 900: '#111827' }}}}}</script>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    </head>
-    <body class="bg-gray-900 text-gray-100 font-sans antialiased flex h-screen overflow-hidden">
-        {% if session.get('admin_logged_in') %}
-        <aside class="w-64 bg-gray-850 flex flex-col h-full border-r border-gray-700">
-            <div class="h-16 flex items-center px-6 border-b border-gray-700 font-bold text-xl text-blue-400">
-                <i class="fas fa-robot mr-2"></i> Bot Admin
-            </div>
-            <nav class="flex-1 px-4 py-6 space-y-2 overflow-y-auto">
-                <a href="/admin" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-tachometer-alt w-6"></i> Dashboard</a>
-                <a href="/admin/users" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-users w-6"></i> Users</a>
-                <a href="/admin/tasks" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-tasks w-6"></i> Tasks</a>
-                <a href="/admin/channels" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-bullhorn w-6"></i> Channels</a>
-                <a href="/admin/withdraws" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-wallet w-6"></i> Withdrawals</a>
-                <a href="/admin/broadcast" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-paper-plane w-6"></i> Broadcast</a>
-                <a href="/admin/settings" class="block px-4 py-2 rounded text-gray-300 hover:bg-gray-700 hover:text-white"><i class="fas fa-cogs w-6"></i> Settings</a>
-            </nav>
-            <div class="p-4 border-t border-gray-700">
-                <a href="/admin/logout" class="block px-4 py-2 bg-red-600 text-white rounded text-center hover:bg-red-700"><i class="fas fa-sign-out-alt"></i> Logout</a>
-            </div>
-        </aside>
-        <main class="flex-1 h-full overflow-y-auto p-8 bg-gray-900">
-            {% block content %}{% endblock %}
-        </main>
-        {% else %}
-            {% block login %}{% endblock %}
-        {% endif %}
-    </body>
-    </html>
-    """,
-    'login.html': """
-    {% extends "base.html" %}
-    {% block login %}
-    <div class="flex items-center justify-center w-full h-screen bg-gray-900">
-        <div class="bg-gray-800 p-8 rounded-lg shadow-xl w-96 border border-gray-700">
-            <h2 class="text-2xl font-bold mb-6 text-center text-blue-400">Admin Login</h2>
-            {% if error %}<p class="text-red-500 mb-4 text-center">{{ error }}</p>{% endif %}
-            <form method="POST">
-                <div class="mb-4"><label class="block text-gray-400 mb-2">Username</label><input type="text" name="username" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500" required></div>
-                <div class="mb-6"><label class="block text-gray-400 mb-2">Password</label><input type="password" name="password" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500" required></div>
-                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition duration-200">Login</button>
-            </form>
-        </div>
-    </div>
-    {% endblock %}
-    """,
-    'dashboard.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-8 text-white">Dashboard Analytics</h1>
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-        <div class="bg-gray-800 p-6 rounded-lg border border-gray-700 shadow"><div class="text-gray-400 mb-1">Total Users</div><div class="text-3xl font-bold text-blue-400">{{ stats.users }}</div></div>
-        <div class="bg-gray-800 p-6 rounded-lg border border-gray-700 shadow"><div class="text-gray-400 mb-1">Total Referrals</div><div class="text-3xl font-bold text-green-400">{{ stats.referrals }}</div></div>
-        <div class="bg-gray-800 p-6 rounded-lg border border-gray-700 shadow"><div class="text-gray-400 mb-1">Total Withdrawn</div><div class="text-3xl font-bold text-yellow-400">{{ stats.withdrawn }}</div></div>
-        <div class="bg-gray-800 p-6 rounded-lg border border-gray-700 shadow"><div class="text-gray-400 mb-1">Pending Withdraws</div><div class="text-3xl font-bold text-red-400">{{ stats.pending_withdraws }}</div></div>
-    </div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div class="bg-gray-800 p-6 rounded-lg border border-gray-700"><h3 class="text-xl font-bold mb-4">Recent Users</h3>
-            <table class="w-full text-left text-sm"><tr class="text-gray-400 border-b border-gray-700"><th>ID</th><th>Username</th><th>Balance</th></tr>
-            {% for u in recent_users %} <tr class="border-b border-gray-700"> <td class="py-2">{{ u.user_id }}</td> <td>{{ u.username }}</td> <td>{{ u.balance }}</td> </tr> {% endfor %}
-            </table>
-        </div>
-    </div>
-    {% endblock %}
-    """,
-    'users.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">Manage Users</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 overflow-x-auto">
-        <table class="w-full text-left"><thead class="border-b border-gray-700 text-gray-400"><tr><th class="py-3">User ID</th><th>Username</th><th>Balance</th><th>Referrals</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>
-            {% for u in users %}
-            <tr class="border-b border-gray-700">
-                <td class="py-3">{{ u.user_id }}</td><td>{{ u.username }}</td>
-                <td>
-                    <form method="POST" action="/admin/users/balance" class="flex items-center gap-2">
-                        <input type="hidden" name="user_id" value="{{ u.user_id }}">
-                        <input type="number" step="0.01" name="balance" value="{{ u.balance }}" class="w-20 px-2 py-1 bg-gray-700 rounded text-sm text-white border border-gray-600">
-                        <button type="submit" class="bg-blue-600 px-2 py-1 rounded text-xs text-white">Save</button>
-                    </form>
-                </td>
-                <td>{{ u.total_referrals }}</td>
-                <td><span class="{{ 'text-red-400' if u.is_blocked else 'text-green-400' }}">{{ 'Blocked' if u.is_blocked else 'Active' }}</span></td>
-                <td>
-                    <form method="POST" action="/admin/users/toggle_block">
-                        <input type="hidden" name="user_id" value="{{ u.user_id }}">
-                        <button type="submit" class="{{ 'bg-green-600' if u.is_blocked else 'bg-red-600' }} px-3 py-1 rounded text-xs text-white">{{ 'Unblock' if u.is_blocked else 'Block' }}</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody></table>
-    </div>
-    {% endblock %}
-    """,
-    'channels.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">Force Join Channels</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
-        <h2 class="text-xl font-bold mb-4">Add Channel</h2>
-        <form method="POST" action="/admin/channels/add" class="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div><label class="block text-sm mb-1">Name</label><input type="text" name="name" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div><label class="block text-sm mb-1">Link (URL)</label><input type="text" name="link" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div><label class="block text-sm mb-1">Channel ID / @username</label><input type="text" name="channel_id" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div class="flex items-end"><button type="submit" class="w-full bg-blue-600 py-2 rounded font-bold hover:bg-blue-700">Add Channel</button></div>
-        </form>
-        <p class="text-xs text-yellow-400 mt-2">* Bot must be an admin in the channel to verify membership.</p>
-    </div>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 overflow-x-auto">
-        <table class="w-full text-left"><thead class="border-b border-gray-700 text-gray-400"><tr><th class="py-3">Name</th><th>Link</th><th>Chat ID</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>
-            {% for c in channels %}
-            <tr class="border-b border-gray-700">
-                <td class="py-3">{{ c.channel_name }}</td><td><a href="{{ c.channel_link }}" target="_blank" class="text-blue-400">{{ c.channel_link }}</a></td>
-                <td>{{ c.channel_id }}</td>
-                <td><span class="{{ 'text-green-400' if c.is_active else 'text-red-400' }}">{{ 'Active' if c.is_active else 'Disabled' }}</span></td>
-                <td class="flex gap-2 py-3">
-                    <form method="POST" action="/admin/channels/toggle"><input type="hidden" name="id" value="{{ c.id }}"><button type="submit" class="bg-yellow-600 px-3 py-1 rounded text-xs">Toggle</button></form>
-                    <form method="POST" action="/admin/channels/delete"><input type="hidden" name="id" value="{{ c.id }}"><button type="submit" class="bg-red-600 px-3 py-1 rounded text-xs">Delete</button></form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody></table>
-    </div>
-    {% endblock %}
-    """,
-    'tasks.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">Task Management</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
-        <h2 class="text-xl font-bold mb-4">Create Task</h2>
-        <form method="POST" action="/admin/tasks/add" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div><label class="block text-sm mb-1">Title</label><input type="text" name="title" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div><label class="block text-sm mb-1">Reward Coins</label><input type="number" step="0.1" name="reward" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div class="md:col-span-2"><label class="block text-sm mb-1">Link (URL)</label><input type="url" name="link" class="w-full p-2 bg-gray-700 rounded border border-gray-600" required></div>
-            <div class="md:col-span-2"><label class="block text-sm mb-1">Description</label><textarea name="description" class="w-full p-2 bg-gray-700 rounded border border-gray-600"></textarea></div>
-            <div class="md:col-span-2"><button type="submit" class="bg-blue-600 px-6 py-2 rounded font-bold hover:bg-blue-700">Add Task</button></div>
-        </form>
-    </div>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 overflow-x-auto">
-        <table class="w-full text-left"><thead class="border-b border-gray-700 text-gray-400"><tr><th class="py-3">Title</th><th>Reward</th><th>Link</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>
-            {% for t in tasks %}
-            <tr class="border-b border-gray-700">
-                <td class="py-3">{{ t.title }}</td><td>{{ t.reward }}</td><td><a href="{{ t.link }}" target="_blank" class="text-blue-400">View Link</a></td>
-                <td><span class="{{ 'text-green-400' if t.is_active else 'text-red-400' }}">{{ 'Active' if t.is_active else 'Disabled' }}</span></td>
-                <td class="flex gap-2 py-3">
-                    <form method="POST" action="/admin/tasks/toggle"><input type="hidden" name="id" value="{{ t.id }}"><button type="submit" class="bg-yellow-600 px-3 py-1 rounded text-xs">Toggle</button></form>
-                    <form method="POST" action="/admin/tasks/delete"><input type="hidden" name="id" value="{{ t.id }}"><button type="submit" class="bg-red-600 px-3 py-1 rounded text-xs">Delete</button></form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody></table>
-    </div>
-    {% endblock %}
-    """,
-    'withdraw.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">Withdraw Requests</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 overflow-x-auto">
-        <table class="w-full text-left"><thead class="border-b border-gray-700 text-gray-400"><tr><th class="py-3">ID</th><th>User ID</th><th>Amount</th><th>Method & Details</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>
-            {% for w in requests %}
-            <tr class="border-b border-gray-700">
-                <td class="py-3">{{ w.id }}</td><td>{{ w.user_id }}</td><td class="font-bold text-yellow-400">{{ w.amount }}</td>
-                <td><b>{{ w.method }}</b><br><span class="text-sm text-gray-400" style="white-space: pre-line;">{{ w.details }}</span></td>
-                <td>
-                    {% if w.status == 'Pending' %}<span class="text-yellow-400 bg-yellow-900 px-2 py-1 rounded text-xs">Pending</span>
-                    {% elif w.status == 'Approved' %}<span class="text-green-400 bg-green-900 px-2 py-1 rounded text-xs">Approved</span>
-                    {% else %}<span class="text-red-400 bg-red-900 px-2 py-1 rounded text-xs">Rejected</span>{% endif %}
-                </td>
-                <td class="flex gap-2 py-3">
-                    {% if w.status == 'Pending' %}
-                    <form method="POST" action="/admin/withdraw/action"><input type="hidden" name="id" value="{{ w.id }}"><input type="hidden" name="action" value="Approve"><button type="submit" class="bg-green-600 hover:bg-green-700 px-3 py-1 rounded text-xs text-white">Approve</button></form>
-                    <form method="POST" action="/admin/withdraw/action"><input type="hidden" name="id" value="{{ w.id }}"><input type="hidden" name="action" value="Reject"><button type="submit" class="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-xs text-white">Reject</button></form>
-                    {% endif %}
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody></table>
-    </div>
-    {% endblock %}
-    """,
-    'settings.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">System Settings</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
-        <form method="POST" action="/admin/settings/save" class="space-y-6">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div><label class="block text-sm mb-2 text-gray-400">Referral Reward</label><input type="number" step="0.1" name="referral_reward" value="{{ settings.referral_reward }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"></div>
-                <div><label class="block text-sm mb-2 text-gray-400">Daily Bonus</label><input type="number" step="0.1" name="daily_bonus" value="{{ settings.daily_bonus }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"></div>
-                <div><label class="block text-sm mb-2 text-gray-400">Minimum Withdraw</label><input type="number" step="0.1" name="min_withdraw" value="{{ settings.min_withdraw }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"></div>
-                <div>
-                    <label class="block text-sm mb-2 text-gray-400">Force Join Global Toggle</label>
-                    <select name="force_join" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500">
-                        <option value="1" {% if settings.force_join == '1' %}selected{% endif %}>Enabled</option>
-                        <option value="0" {% if settings.force_join == '0' %}selected{% endif %}>Disabled</option>
-                    </select>
-                </div>
-                <div class="md:col-span-2"><label class="block text-sm mb-2 text-gray-400">Welcome Message</label><textarea name="welcome_message" rows="3" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500">{{ settings.welcome_message }}</textarea></div>
-                <div class="md:col-span-2"><label class="block text-sm mb-2 text-gray-400">Bot Token</label><input type="text" name="bot_token" value="{{ settings.bot_token }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"><p class="text-xs text-red-400 mt-1">If you change the token, you MUST restart the python script manually from the terminal for it to take effect.</p></div>
-                <div class="md:col-span-2 pt-4 border-t border-gray-700">
-                    <h3 class="text-lg font-bold mb-4">Change Admin Password</h3>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div><input type="password" name="new_password" placeholder="New Password (leave blank to keep current)" class="w-full p-3 bg-gray-700 rounded border border-gray-600"></div>
-                    </div>
-                </div>
-            </div>
-            <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded shadow-lg transition duration-200">Save All Settings</button>
-        </form>
-    </div>
-    {% endblock %}
-    """,
-    'broadcast.html': """
-    {% extends "base.html" %}
-    {% block content %}
-    <h1 class="text-3xl font-bold mb-6">Broadcast Message</h1>
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
-        <form method="POST" action="/admin/broadcast/send" class="space-y-4">
-            <div><label class="block text-sm mb-2 text-gray-400">Message to all users (HTML allowed)</label><textarea name="message" rows="6" class="w-full p-4 bg-gray-700 rounded border border-gray-600 focus:outline-none focus:border-blue-500" required placeholder="Hello everyone!"></textarea></div>
-            <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded shadow-lg transition duration-200">Send to All Users</button>
-        </form>
-    </div>
-    {% endblock %}
-    """
-}
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
-# ==========================================
-# FLASK WEB SERVER (ADMIN PANEL)
-# ==========================================
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
+def get_setting(key, default=None):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row['value']
+    return default
 
-# RENDER FIX: Trust the reverse proxy headers so Flask works cleanly behind HTTPS on Render
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+def set_setting(key, value):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
 
-env = Environment(loader=DictLoader(HTML_TEMPLATES))
-
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('admin_logged_in'):
-            return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return decorated_function
-
-def render(template_name, **context):
-    return env.get_template(template_name).render(session=session, **context)
-
-def send_telegram_message(chat_id, text):
-    token = get_setting('bot_token') or BOT_TOKEN
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Failed to send notification via HTTP: {e}")
-
-# RENDER FIX: Health check endpoint so Render knows the app is running
-@app.route('/ping')
-def ping():
-    return "OK", 200
-
-@app.route('/')
-def index():
-    return redirect(url_for('admin_login'))
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        admin = query_db("SELECT * FROM admin WHERE username=? AND password=?", (username, password), one=True)
-        if admin:
-            session['admin_logged_in'] = True
-            return redirect(url_for('admin_dashboard'))
-        return render('login.html', error="Invalid Credentials")
-    return render('login.html')
-
-@app.route('/admin/logout')
-def admin_logout():
-    session.clear()
-    return redirect(url_for('admin_login'))
-
-@app.route('/admin')
-@login_required
-def admin_dashboard():
-    stats = {
-        'users': query_db("SELECT COUNT(*) as c FROM users", one=True)['c'],
-        'referrals': query_db("SELECT COUNT(*) as c FROM referrals", one=True)['c'],
-        'withdrawn': query_db("SELECT SUM(amount) as c FROM withdraw_requests WHERE status='Approved'", one=True)['c'] or 0,
-        'pending_withdraws': query_db("SELECT COUNT(*) as c FROM withdraw_requests WHERE status='Pending'", one=True)['c']
-    }
-    recent_users = query_db("SELECT * FROM users ORDER BY join_date DESC LIMIT 5")
-    return render('dashboard.html', stats=stats, recent_users=recent_users)
-
-@app.route('/admin/users')
-@login_required
-def admin_users():
-    users = query_db("SELECT * FROM users ORDER BY id DESC")
-    return render('users.html', users=users)
-
-@app.route('/admin/users/balance', methods=['POST'])
-@login_required
-def admin_edit_balance():
-    query_db("UPDATE users SET balance=? WHERE user_id=?", (request.form['balance'], request.form['user_id']), commit=True)
-    return redirect(url_for('admin_users'))
-
-@app.route('/admin/users/toggle_block', methods=['POST'])
-@login_required
-def admin_toggle_block():
-    query_db("UPDATE users SET is_blocked = CASE WHEN is_blocked=1 THEN 0 ELSE 1 END WHERE user_id=?", (request.form['user_id'],), commit=True)
-    return redirect(url_for('admin_users'))
-
-@app.route('/admin/channels', methods=['GET'])
-@login_required
-def admin_channels():
-    channels = query_db("SELECT * FROM channels ORDER BY id DESC")
-    return render('channels.html', channels=channels)
-
-@app.route('/admin/channels/add', methods=['POST'])
-@login_required
-def admin_add_channel():
-    query_db("INSERT INTO channels (channel_name, channel_link, channel_id) VALUES (?, ?, ?)", 
-             (request.form['name'], request.form['link'], request.form['channel_id']), commit=True)
-    return redirect(url_for('admin_channels'))
-
-@app.route('/admin/channels/toggle', methods=['POST'])
-@login_required
-def admin_toggle_channel():
-    query_db("UPDATE channels SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?", (request.form['id'],), commit=True)
-    return redirect(url_for('admin_channels'))
-
-@app.route('/admin/channels/delete', methods=['POST'])
-@login_required
-def admin_delete_channel():
-    query_db("DELETE FROM channels WHERE id=?", (request.form['id'],), commit=True)
-    return redirect(url_for('admin_channels'))
-
-@app.route('/admin/tasks', methods=['GET'])
-@login_required
-def admin_tasks():
-    tasks = query_db("SELECT * FROM tasks ORDER BY id DESC")
-    return render('tasks.html', tasks=tasks)
-
-@app.route('/admin/tasks/add', methods=['POST'])
-@login_required
-def admin_add_task():
-    query_db("INSERT INTO tasks (title, reward, link, description) VALUES (?, ?, ?, ?)", 
-             (request.form['title'], request.form['reward'], request.form['link'], request.form['description']), commit=True)
-    return redirect(url_for('admin_tasks'))
-
-@app.route('/admin/tasks/toggle', methods=['POST'])
-@login_required
-def admin_toggle_task():
-    query_db("UPDATE tasks SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?", (request.form['id'],), commit=True)
-    return redirect(url_for('admin_tasks'))
-
-@app.route('/admin/tasks/delete', methods=['POST'])
-@login_required
-def admin_delete_task():
-    query_db("DELETE FROM tasks WHERE id=?", (request.form['id'],), commit=True)
-    return redirect(url_for('admin_tasks'))
-
-@app.route('/admin/withdraws', methods=['GET'])
-@login_required
-def admin_withdraws():
-    reqs = query_db("SELECT * FROM withdraw_requests ORDER BY id DESC")
-    return render('withdraw.html', requests=reqs)
-
-@app.route('/admin/withdraw/action', methods=['POST'])
-@login_required
-def admin_withdraw_action():
-    action = request.form['action'] 
-    req_id = request.form['id']
-    
-    w = query_db("SELECT user_id, amount FROM withdraw_requests WHERE id=?", (req_id,), one=True)
-    if not w:
-        return redirect(url_for('admin_withdraws'))
-        
-    user_id = w['user_id']
-    amount = w['amount']
-
-    final_status = 'Approved' if action == 'Approve' else 'Rejected'
-    query_db("UPDATE withdraw_requests SET status=? WHERE id=?", (final_status, req_id), commit=True)
-    
-    if action == 'Approve':
-        text = f"✅ <b>Withdrawal Approved!</b>\nYour withdrawal request of <b>{amount} coins</b> has been successfully processed."
-        send_telegram_message(user_id, text)
-    elif action == 'Reject':
-        query_db("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id), commit=True)
-        text = f"❌ <b>Withdrawal Rejected!</b>\nYour withdrawal request of <b>{amount} coins</b> was declined. The coins have been refunded to your bot balance."
-        send_telegram_message(user_id, text)
-        
-    return redirect(url_for('admin_withdraws'))
-
-@app.route('/admin/settings', methods=['GET'])
-@login_required
-def admin_settings():
-    rows = query_db("SELECT key, value FROM settings")
-    settings = {r['key']: r['value'] for r in rows}
-    return render('settings.html', settings=settings)
-
-@app.route('/admin/settings/save', methods=['POST'])
-@login_required
-def admin_save_settings():
-    keys =['referral_reward', 'daily_bonus', 'min_withdraw', 'welcome_message', 'force_join', 'bot_token']
-    for k in keys:
-        if k in request.form:
-            set_setting(k, request.form[k])
-    
-    new_pass = request.form.get('new_password')
-    if new_pass:
-        query_db("UPDATE admin SET password=? WHERE username=?", (new_pass, ADMIN_USERNAME), commit=True)
-        
-    return redirect(url_for('admin_settings'))
-
-@app.route('/admin/broadcast', methods=['GET'])
-@login_required
-def admin_broadcast():
-    return render('broadcast.html')
-
-@app.route('/admin/broadcast/send', methods=['POST'])
-@login_required
-def admin_broadcast_send():
-    msg = request.form['message']
-    query_db("INSERT INTO broadcast_queue (message) VALUES (?)", (msg,), commit=True)
-    return redirect(url_for('admin_broadcast'))
-
-
-def run_flask():
-    # RENDER FIX: Bind to 0.0.0.0 and dynamically assigned PORT
-    app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, use_reloader=False)
-
-# ==========================================
-# TELEGRAM BOT SYSTEM
-# ==========================================
-
-USER_STATES = {}
-
-def get_main_keyboard():
-    """Inline keyboard for user panel - no duplicate message bug"""
-    buttons = [
-        [InlineKeyboardButton("👤 Profile", callback_data="menu_profile"),
-         InlineKeyboardButton("📋 Tasks", callback_data="menu_tasks")],
-        [InlineKeyboardButton("🎁 Daily Bonus", callback_data="menu_daily"),
-         InlineKeyboardButton("👥 Referrals", callback_data="menu_referrals")],
-        [InlineKeyboardButton("💰 Balance", callback_data="menu_balance"),
-         InlineKeyboardButton("💳 Withdraw", callback_data="menu_withdraw")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="menu_leaderboard"),
-         InlineKeyboardButton("ℹ️ Help", callback_data="menu_help")],
+def get_main_keyboard(user_id=None):
+    keyboard = [
+        [KeyboardButton("👤 Profile"), KeyboardButton("📋 Tasks")],
+        [KeyboardButton("🎁 Daily Bonus"), KeyboardButton("👥 Referrals")],
+        [KeyboardButton("💰 Balance"), KeyboardButton("💳 Withdraw")],
+        [KeyboardButton("🏆 Leaderboard"), KeyboardButton("ℹ️ Help")]
     ]
-    return InlineKeyboardMarkup(buttons)
+    
+    if user_id and is_admin(user_id):
+        keyboard.append([KeyboardButton("⚙️ Admin Panel")])
+    
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+def get_admin_keyboard():
+    keyboard = [
+        [KeyboardButton("📢 Broadcast"), KeyboardButton("➕ Add Task")],
+        [KeyboardButton("📋 All Tasks"), KeyboardButton("➕ Add Channel")],
+        [KeyboardButton("📊 Statistics"), KeyboardButton("👥 All Users")],
+        [KeyboardButton("💳 Withdraw Requests"), KeyboardButton("⚙️ Settings")],
+        [KeyboardButton("◀️ Back to Main")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# ==========================================
+# FORCE JOIN CHECK
+# ==========================================
 async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user: return
+    if get_setting('force_join') != '1':
+        return True
+    
     user_id = update.effective_user.id
     
-    u = query_db("SELECT is_blocked FROM users WHERE user_id=?", (user_id,), one=True)
-    if u and u['is_blocked']:
-        if update.message: await update.message.reply_text("❌ You are blocked from using this bot.")
-        elif update.callback_query: await update.callback_query.answer("❌ You are blocked.", show_alert=True)
-        raise ApplicationHandlerStop()
-
-    if get_setting('force_join') == '1':
-        channels = query_db("SELECT * FROM channels WHERE is_active=1")
-        if channels:
-            not_joined =[]
-            for c in channels:
-                try:
-                    member = await context.bot.get_chat_member(chat_id=c['channel_id'], user_id=user_id)
-                    if member.status not in['member', 'administrator', 'creator']:
-                        not_joined.append(c)
-                except Exception as e:
-                    logger.error(f"Force join check failed for {c['channel_id']}: {e}")
-                    not_joined.append(c)
-
-            if not_joined:
-                buttons = [[InlineKeyboardButton(c['channel_name'], url=c['channel_link'])] for c in not_joined]
-                buttons.append([InlineKeyboardButton("✅ Check Join", callback_data="check_join")])
-                markup = InlineKeyboardMarkup(buttons)
-                
-                msg = "🛑 *Please join the required channel(s) to continue.*"
-                if update.message:
-                    await update.message.reply_text(msg, reply_markup=markup, parse_mode='Markdown')
-                elif update.callback_query and update.callback_query.data != "check_join":
-                    await update.callback_query.message.reply_text(msg, reply_markup=markup, parse_mode='Markdown')
-                    await update.callback_query.answer()
-                
-                raise ApplicationHandlerStop()
-
-async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
-    item = query_db("SELECT * FROM broadcast_queue WHERE status='Pending' LIMIT 1", one=True)
-    if not item:
-        return
-    query_db("UPDATE broadcast_queue SET status='Processing' WHERE id=?", (item['id'],), commit=True)
-    users = query_db("SELECT user_id FROM users WHERE is_blocked=0")
-    success = 0
-    fail = 0
-    for u in users:
-        try:
-            await context.bot.send_message(chat_id=u['user_id'], text=item['message'], parse_mode='HTML')
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.warning(f"Broadcast failed for {u['user_id']}: {e}")
-            fail += 1
-    query_db("UPDATE broadcast_queue SET status='Done' WHERE id=?", (item['id'],), commit=True)
-    logger.info(f"Broadcast done. Success: {success}, Failed: {fail}")
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = query_db("SELECT * FROM users WHERE user_id=?", (user.id,), one=True)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM channels WHERE is_active = 1")
+    channels = c.fetchall()
+    conn.close()
     
-    if not u:
-        query_db("INSERT INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username), commit=True)
+    if not channels:
+        return True
+    
+    not_joined = []
+    for channel in channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel['chat_id'], user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                not_joined.append(channel)
+        except:
+            not_joined.append(channel)
+    
+    if not_joined:
+        buttons = [[InlineKeyboardButton(ch['name'], url=ch['link'])] for ch in not_joined]
+        buttons.append([InlineKeyboardButton("✅ Check Again", callback_data="check_join")])
         
+        msg = "🔒 *Please join the following channels to use this bot:*"
+        if update.message:
+            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode='Markdown')
+        elif update.callback_query:
+            await update.callback_query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode='Markdown')
+        return False
+    
+    return True
+
+# ==========================================
+# BOT COMMANDS
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user.id,))
+    existing = c.fetchone()
+    
+    if not existing:
+        c.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username))
+        
+        # Check referral
         args = context.args
         if args and args[0].isdigit():
             referrer_id = int(args[0])
             if referrer_id != user.id:
-                reward = get_setting('referral_reward', float)
-                query_db("INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, user.id), commit=True)
-                query_db("UPDATE users SET balance = balance + ?, total_referrals = total_referrals + 1, successful_referrals = successful_referrals + 1 WHERE user_id=?", 
-                         (reward, referrer_id), commit=True)
+                reward = float(get_setting('referral_reward', '10'))
+                c.execute("INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, user.id))
+                c.execute("UPDATE users SET balance = balance + ?, total_referrals = total_referrals + 1 WHERE user_id = ?", 
+                         (reward, referrer_id))
                 try:
-                    await context.bot.send_message(chat_id=referrer_id, text=f"🎉 *New Referral!* You earned {reward} coins.", parse_mode='Markdown')
-                except: pass
-
-    welcome = get_setting('welcome_message')
-    await update.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
-
-
-async def process_withdrawal(update, user_id, amount, method, details):
-    query_db("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, user_id), commit=True)
-    query_db("INSERT INTO withdraw_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)", 
-             (user_id, amount, method, details), commit=True)
+                    await context.bot.send_message(referrer_id, f"🎉 *New Referral!* +{reward} coins", parse_mode='Markdown')
+                except:
+                    pass
+        
+        conn.commit()
     
-    if user_id in USER_STATES:
-        del USER_STATES[user_id]
-        
-    await update.message.reply_text("✅ *Withdrawal Request Submitted!*\nAdmin will review it soon.", parse_mode='Markdown')
-    # Show menu again
-    welcome = get_setting('welcome_message')
-    await update.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
+    conn.close()
+    
+    welcome = get_setting('welcome_message', 'Welcome to Earn Bot!')
+    await update.message.reply_text(welcome, reply_markup=get_main_keyboard(user.id), parse_mode='Markdown')
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    await update.message.reply_text(f"💰 *Your Balance:* {row['balance']} coins", parse_mode='Markdown')
 
-    # Admin broadcast state
-    if user_id in USER_STATES and USER_STATES[user_id].get('step') == 'admin_broadcast':
-        if is_admin(user_id):
-            query_db("INSERT INTO broadcast_queue (message) VALUES (?)", (text,), commit=True)
-            del USER_STATES[user_id]
-            await update.message.reply_text("✅ Broadcast queued! It will be sent to all users shortly.")
-        return
-
-    if user_id in USER_STATES:
-        state = USER_STATES[user_id]
-        
-        if state['step'] == 'amount':
-            try:
-                amount = float(text)
-                min_w = get_setting('min_withdraw', float)
-                user_data = query_db("SELECT balance FROM users WHERE user_id=?", (user_id,), one=True)
-                
-                if amount < min_w:
-                    await update.message.reply_text(f"❌ Minimum withdrawal is {min_w} coins.")
-                    del USER_STATES[user_id]
-                    return
-                if amount > user_data['balance']:
-                    await update.message.reply_text("❌ Insufficient balance.")
-                    del USER_STATES[user_id]
-                    return
-                
-                USER_STATES[user_id]['amount'] = amount
-                USER_STATES[user_id]['step'] = 'method'
-                
-                method_kb_inline = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🏦 Bank Transfer", callback_data="wm_bank"),
-                     InlineKeyboardButton("📱 UPI", callback_data="wm_upi")],
-                    [InlineKeyboardButton("💳 Crypto", callback_data="wm_crypto"),
-                     InlineKeyboardButton("❌ Cancel", callback_data="wm_cancel")]
-                ])
-                await update.message.reply_text("🏦 *Select Payment Method:*", parse_mode='Markdown', reply_markup=method_kb_inline)
-            except ValueError:
-                await update.message.reply_text("❌ Please enter a valid number.")
-            return
-            
-        elif state['step'] == 'method':
-            if text == "🏦 Bank Transfer":
-                USER_STATES[user_id]['method'] = 'Bank Transfer'
-                USER_STATES[user_id]['step'] = 'bank_name'
-                await update.message.reply_text("🏦 *Enter Bank Name:*\n(Type /cancel to cancel)", parse_mode='Markdown')
-            
-            elif text == "📱 UPI":
-                USER_STATES[user_id]['method'] = 'UPI'
-                USER_STATES[user_id]['step'] = 'upi_id'
-                await update.message.reply_text("📱 *Enter your UPI ID:*\n(Type /cancel to cancel)", parse_mode='Markdown')
-            
-            elif text == "💳 Crypto":
-                USER_STATES[user_id]['method'] = 'Crypto'
-                USER_STATES[user_id]['step'] = 'crypto_address'
-                await update.message.reply_text("💳 *Enter your Crypto Wallet Address:*\n(Type /cancel to cancel)", parse_mode='Markdown')
-            
-            else:
-                await update.message.reply_text("❌ Please select a valid method from the keyboard.")
-            return
-            
-        elif state['step'] == 'bank_name':
-            USER_STATES[user_id]['bank_name'] = text
-            USER_STATES[user_id]['step'] = 'bank_ac_num'
-            await update.message.reply_text("🔢 *Enter Account Number:*", parse_mode='Markdown')
-            return
-            
-        elif state['step'] == 'bank_ac_num':
-            USER_STATES[user_id]['bank_ac_num'] = text
-            USER_STATES[user_id]['step'] = 'bank_ifsc'
-            await update.message.reply_text("🔠 *Enter IFSC Code:*", parse_mode='Markdown')
-            return
-            
-        elif state['step'] == 'bank_ifsc':
-            USER_STATES[user_id]['bank_ifsc'] = text
-            USER_STATES[user_id]['step'] = 'bank_holder'
-            await update.message.reply_text("👤 *Enter Account Holder Name:*", parse_mode='Markdown')
-            return
-            
-        elif state['step'] == 'bank_holder':
-            USER_STATES[user_id]['bank_holder'] = text
-            details = f"Bank Name: {USER_STATES[user_id]['bank_name']}\nA/C No: {USER_STATES[user_id]['bank_ac_num']}\nIFSC: {USER_STATES[user_id]['bank_ifsc']}\nHolder: {USER_STATES[user_id]['bank_holder']}"
-            await process_withdrawal(update, user_id, state['amount'], "Bank Transfer", details)
-            return
-
-        elif state['step'] == 'upi_id':
-            details = f"UPI ID: {text}"
-            await process_withdrawal(update, user_id, state['amount'], "UPI", details)
-            return
-            
-        elif state['step'] == 'crypto_address':
-            details = f"Wallet Address: {text}"
-            await process_withdrawal(update, user_id, state['amount'], "Crypto", details)
-            return
-
-
-    # Unknown text - show menu
-    else:
-        welcome = get_setting('welcome_message')
-        await update.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    user_id = query.from_user.id
-
-    if data == "check_join":
-        await query.answer("Checking membership...")
-        await query.message.delete()
-        await context.bot.send_message(chat_id=user_id, text="✅ Thank you for joining! You can now use the bot.", reply_markup=get_main_keyboard())
-        return
-
-    # ===== USER MENU INLINE BUTTONS =====
-    if data == "menu_balance":
-        await query.answer()
-        u = query_db("SELECT balance FROM users WHERE user_id=?", (user_id,), one=True)
-        await query.message.reply_text(f"💰 *Your Balance:* {u['balance']} coins", parse_mode='Markdown', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_profile":
-        await query.answer()
-        u = query_db("SELECT * FROM users WHERE user_id=?", (user_id,), one=True)
-        tasks_done = query_db("SELECT COUNT(*) as c FROM user_tasks WHERE user_id=?", (user_id,), one=True)['c']
-        msg = ("👤 *Your Profile*\n\n"
-               f"🆔 ID: `{u['user_id']}`\n"
-               f"📅 Joined: {u['join_date'][:10]}\n\n"
-               f"💰 Balance: *{u['balance']} coins*\n"
-               f"👥 Referrals: *{u['total_referrals']}*\n"
-               f"📋 Tasks Completed: *{tasks_done}*")
-        await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_referrals":
-        await query.answer()
-        u = query_db("SELECT total_referrals FROM users WHERE user_id=?", (user_id,), one=True)
-        bot_username = context.bot.username
-        link = f"https://t.me/{bot_username}?start={user_id}"
-        reward = get_setting('referral_reward')
-        msg = (f"👥 *Referral System*\n\n"
-               f"Reward per invite: *{reward} coins*\n"
-               f"Your Total Invites: *{u['total_referrals']}*\n\n"
-               f"🔗 *Your Referral Link:*\n`{link}`\n\n"
-               f"Share this link to earn coins!")
-        await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_daily":
-        await query.answer()
-        u = query_db("SELECT last_bonus FROM users WHERE user_id=?", (user_id,), one=True)
-        now = datetime.now()
-        can_claim = True
-        if u['last_bonus']:
-            last = datetime.strptime(u['last_bonus'], "%Y-%m-%d %H:%M:%S")
-            if now < last + timedelta(days=1):
-                can_claim = False
-                wait_time = (last + timedelta(days=1)) - now
-                hours, remainder = divmod(wait_time.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-                await query.message.reply_text(f"⏳ Already claimed!\nCome back in *{hours}h {minutes}m*.", parse_mode='Markdown', reply_markup=get_main_keyboard())
-        if can_claim:
-            bonus = get_setting('daily_bonus', float)
-            query_db("UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
-                     (bonus, now.strftime("%Y-%m-%d %H:%M:%S"), user_id), commit=True)
-            await query.message.reply_text(f"🎁 *Daily Bonus Claimed!*\nYou received *{bonus}* coins! 🎉", parse_mode='Markdown', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_tasks":
-        await query.answer()
-        tasks = query_db("SELECT * FROM tasks WHERE is_active=1")
-        if not tasks:
-            await query.message.reply_text("📋 No tasks available right now.", reply_markup=get_main_keyboard())
-            return
-        markup = []
-        for t in tasks:
-            markup.append([InlineKeyboardButton(f"🪙 {t['reward']} | {t['title']}", callback_data=f"task_info_{t['id']}")])
-        markup.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")])
-        await query.message.reply_text("📋 *Available Tasks*\nSelect a task to complete it:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(markup))
-        return
-
-    if data == "menu_leaderboard":
-        await query.answer()
-        top = query_db("SELECT username, total_referrals, balance FROM users WHERE is_blocked=0 ORDER BY total_referrals DESC, balance DESC LIMIT 10")
-        msg = "🏆 <b>Top 10 Leaderboard</b>\n\n"
-        for i, t in enumerate(top, 1):
-            name = (t['username'] or "Unknown").replace('<', '&lt;').replace('>', '&gt;')
-            msg += f"<b>{i}.</b> {name} — {t['total_referrals']} Refs | {t['balance']} Coins\n"
-        await query.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_help":
-        await query.answer()
-        msg = ("ℹ️ *Help & Information*\n\n"
-               "1. *Referral*: Share your referral link to earn coins per invite.\n"
-               "2. *Tasks*: Complete tasks to earn extra coins.\n"
-               "3. *Daily Bonus*: Claim free coins every 24 hours.\n"
-               "4. *Withdraw*: Once balance reaches minimum, use Withdraw button.")
-        await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_keyboard())
-        return
-
-    if data == "menu_withdraw" or data == "menu_back_withdraw":
-        await query.answer()
-        u = query_db("SELECT balance FROM users WHERE user_id=?", (user_id,), one=True)
-        min_w = get_setting('min_withdraw', float)
-        if u['balance'] < min_w:
-            await query.message.reply_text(
-                f"❌ *Insufficient balance.*\n\nYour balance: {u['balance']}\nMinimum withdraw: {min_w}",
-                parse_mode='Markdown', reply_markup=get_main_keyboard())
-            return
-        USER_STATES[user_id] = {'step': 'amount', 'balance': u['balance']}
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="withdraw_cancel")]])
-        await query.message.reply_text(
-            f"💳 *Withdrawal*\n\nBalance: {u['balance']} coins\nMinimum: {min_w} coins\n\nType the amount to withdraw:",
-            parse_mode='Markdown', reply_markup=cancel_btn)
-        return
-
-    if data == "withdraw_cancel":
-        await query.answer("Cancelled")
-        if user_id in USER_STATES:
-            del USER_STATES[user_id]
-        welcome = get_setting('welcome_message')
-        await query.message.edit_text("❌ Withdrawal cancelled.")
-        await query.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
-        return
-
-    if data == "menu_back":
-        await query.answer()
-        welcome = get_setting('welcome_message')
-        await query.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
-        return
-
-    # ===== WITHDRAW METHOD SELECTION (inline) =====
-    if data in ("wm_bank", "wm_upi", "wm_crypto", "wm_cancel"):
-        await query.answer()
-        if data == "wm_cancel":
-            if user_id in USER_STATES: del USER_STATES[user_id]
-            welcome = get_setting('welcome_message')
-            await query.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
-            return
-        if user_id not in USER_STATES:
-            await query.message.reply_text("Session expired. Please try again.", reply_markup=get_main_keyboard())
-            return
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="wm_cancel")]])
-        if data == "wm_bank":
-            USER_STATES[user_id]['method'] = 'Bank Transfer'
-            USER_STATES[user_id]['step'] = 'bank_name'
-            await query.message.reply_text("🏦 *Enter Bank Name:*\n(Type /cancel to abort)", parse_mode='Markdown', reply_markup=cancel_btn)
-        elif data == "wm_upi":
-            USER_STATES[user_id]['method'] = 'UPI'
-            USER_STATES[user_id]['step'] = 'upi_id'
-            await query.message.reply_text("📱 *Enter your UPI ID:*\n(Type /cancel to abort)", parse_mode='Markdown', reply_markup=cancel_btn)
-        elif data == "wm_crypto":
-            USER_STATES[user_id]['method'] = 'Crypto'
-            USER_STATES[user_id]['step'] = 'crypto_address'
-            await query.message.reply_text("💳 *Enter your Crypto Wallet Address:*\n(Type /cancel to abort)", parse_mode='Markdown', reply_markup=cancel_btn)
-        return
-
-    if data.startswith("task_info_"):
-        task_id = int(data.split("_")[2])
-        task = query_db("SELECT * FROM tasks WHERE id=?", (task_id,), one=True)
-        if not task:
-            await query.answer("Task not found.", show_alert=True)
-            return
-            
-        done = query_db("SELECT * FROM user_tasks WHERE user_id=? AND task_id=?", (user_id, task_id), one=True)
-        if done:
-            await query.answer("You already completed this task!", show_alert=True)
-            return
-
-        msg = f"📋 *{task['title']}*\n\n" \
-              f"Reward: {task['reward']} coins\n" \
-              f"Description: {task['description']}\n\n" \
-              f"Click the button below to complete the task."
-              
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Task Link", url=task['link'])],[InlineKeyboardButton("✅ Verify & Complete", callback_data=f"task_done_{task_id}")]
-        ])
-        await query.message.edit_text(msg, parse_mode='Markdown', reply_markup=markup)
-
-    elif data.startswith("task_done_"):
-        task_id = int(data.split("_")[2])
-        task = query_db("SELECT * FROM tasks WHERE id=?", (task_id,), one=True)
-        
-        done = query_db("SELECT * FROM user_tasks WHERE user_id=? AND task_id=?", (user_id, task_id), one=True)
-        if done:
-            await query.answer("Already completed!", show_alert=True)
-            return
-
-        query_db("INSERT INTO user_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id), commit=True)
-        query_db("UPDATE users SET balance = balance + ? WHERE user_id=?", (task['reward'], user_id), commit=True)
-        
-        await query.answer(f"Task completed! You earned {task['reward']} coins.", show_alert=True)
-        await query.message.edit_text(f"✅ *Task Completed!*\nYou earned {task['reward']} coins.", parse_mode='Markdown')
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in USER_STATES:
-        del USER_STATES[user_id]
-    welcome = get_setting('welcome_message')
-    await update.message.reply_text("❌ Cancelled.", parse_mode='HTML')
-    await update.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = c.fetchone()
+    c.execute("SELECT COUNT(*) as count FROM user_tasks WHERE user_id = ?", (user_id,))
+    tasks_done = c.fetchone()
+    conn.close()
+    
+    msg = f"👤 *Your Profile*\n\n"
+    msg += f"🆔 ID: `{user['user_id']}`\n"
+    msg += f"📅 Joined: {user['join_date'][:10]}\n"
+    msg += f"💰 Balance: {user['balance']} coins\n"
+    msg += f"👥 Referrals: {user['total_referrals']}\n"
+    msg += f"📋 Tasks Completed: {tasks_done['count']}\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT total_referrals FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start={user_id}"
+    reward = get_setting('referral_reward', '10')
+    
+    msg = f"👥 *Referral System*\n\n"
+    msg += f"💰 Reward per invite: *{reward} coins*\n"
+    msg += f"👥 Your invites: *{row['total_referrals']}*\n\n"
+    msg += f"🔗 *Your Link:*\n`{link}`\n\n"
+    msg += f"Share this link with friends to earn coins!"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    
+    now = datetime.now()
+    
+    if row and row['last_bonus']:
+        last = datetime.strptime(row['last_bonus'], "%Y-%m-%d %H:%M:%S.%f")
+        if now < last + timedelta(days=1):
+            wait = (last + timedelta(days=1)) - now
+            hours = wait.seconds // 3600
+            minutes = (wait.seconds % 3600) // 60
+            await update.message.reply_text(f"⏳ You already claimed today's bonus!\nCome back in *{hours}h {minutes}m*", parse_mode='Markdown')
+            conn.close()
+            return
+    
+    bonus = float(get_setting('daily_bonus', '5'))
+    c.execute("UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id = ?", 
+             (bonus, now, user_id))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"🎁 *Daily Bonus Claimed!*\n+{bonus} coins", parse_mode='Markdown')
+
+async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM tasks WHERE is_active = 1")
+    tasks_list = c.fetchall()
+    conn.close()
+    
+    if not tasks_list:
+        await update.message.reply_text("📋 No tasks available right now.")
+        return
+    
+    for task in tasks_list:
+        conn2 = get_db()
+        c2 = conn2.cursor()
+        c2.execute("SELECT * FROM user_tasks WHERE user_id = ? AND task_id = ?", (user_id, task['id']))
+        done = c2.fetchone()
+        conn2.close()
+        
+        status = "✅ COMPLETED" if done else "🟢 AVAILABLE"
+        msg = f"📋 *{task['title']}*\n"
+        msg += f"💰 Reward: {task['reward']} coins\n"
+        msg += f"📝 {task['description']}\n"
+        msg += f"Status: {status}\n"
+        
+        if not done:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔗 Start Task", url=task['link']),
+                InlineKeyboardButton("✅ Verify", callback_data=f"verify_{task['id']}")
+            ]])
+            await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
+        else:
+            await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT username, total_referrals, balance FROM users WHERE is_blocked = 0 ORDER BY total_referrals DESC, balance DESC LIMIT 10")
+    top = c.fetchall()
+    conn.close()
+    
+    msg = "🏆 *Top 10 Users*\n\n"
+    for i, user in enumerate(top, 1):
+        name = user['username'] or "Anonymous"
+        msg += f"{i}. {name} - {user['total_referrals']} refs | {user['balance']} coins\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "ℹ️ *How to use this bot*\n\n"
+    msg += "1️⃣ *Referrals* - Get your link from Referrals menu and share\n"
+    msg += "2️⃣ *Tasks* - Complete tasks to earn coins\n"
+    msg += "3️⃣ *Daily Bonus* - Claim daily bonus every 24h\n"
+    msg += "4️⃣ *Withdraw* - Minimum " + get_setting('min_withdraw', '100') + " coins required\n\n"
+    msg += "Need help? Contact @support"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ==========================================
-# BOT ADMIN PANEL (Telegram Me Admin Panel)
+# WITHDRAWAL SYSTEM
 # ==========================================
-ADMIN_IDS = [int(ADMIN_TELEGRAM_ID)]
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ You are not authorized.")
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    user = c.fetchone()
+    conn.close()
+    
+    min_withdraw = float(get_setting('min_withdraw', '100'))
+    
+    if user['balance'] < min_withdraw:
+        await update.message.reply_text(f"❌ Minimum withdrawal is *{min_withdraw}* coins\nYour balance: *{user['balance']}* coins", parse_mode='Markdown')
         return
     
-    stats = {
-        'users': query_db("SELECT COUNT(*) as c FROM users", one=True)['c'],
-        'referrals': query_db("SELECT COUNT(*) as c FROM referrals", one=True)['c'],
-        'withdrawn': query_db("SELECT SUM(amount) as c FROM withdraw_requests WHERE status='Approved'", one=True)['c'] or 0,
-        'pending': query_db("SELECT COUNT(*) as c FROM withdraw_requests WHERE status='Pending'", one=True)['c'],
-        'blocked': query_db("SELECT COUNT(*) as c FROM users WHERE is_blocked=1", one=True)['c'],
-    }
-    
-    msg = (
-        "🤖 <b>Admin Panel</b>\n\n"
-        f"👥 Total Users: <b>{stats['users']}</b>\n"
-        f"🔗 Total Referrals: <b>{stats['referrals']}</b>\n"
-        f"💰 Total Withdrawn: <b>{stats['withdrawn']}</b>\n"
-        f"⏳ Pending Withdrawals: <b>{stats['pending']}</b>\n"
-        f"🚫 Blocked Users: <b>{stats['blocked']}</b>\n\n"
-        "📌 <b>Commands:</b>\n"
-        "/broadcast - Broadcast message to all users\n"
-        "/pending_withdraws - See pending withdrawals\n"
-        "/approve_withdraw [id] - Approve a withdrawal\n"
-        "/reject_withdraw [id] - Reject a withdrawal\n"
-        "/set_balance [user_id] [amount] - Set user balance\n"
-        "/block_user [user_id] - Block a user\n"
-        "/unblock_user [user_id] - Unblock a user\n"
-        "/add_task [reward] [link] [title] - Add a task\n"
-        "/list_tasks - List all tasks\n"
-        "/delete_task [id] - Delete a task\n"
-        "/add_channel [@id] [link] [name] - Add force join channel\n"
-        "/list_channels - List channels\n"
-        "/delete_channel [id] - Delete channel\n"
-        "/settings - View/change bot settings\n"
-        "/set_setting [key] [value] - Change a setting\n"
-        "/user_info [user_id] - Get user info"
-    )
-    
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats", callback_data="adm_stats"),
-         InlineKeyboardButton("👥 Users", callback_data="adm_users")],
-        [InlineKeyboardButton("💳 Pending Withdraws", callback_data="adm_withdraws")],
-        [InlineKeyboardButton("📣 Broadcast", callback_data="adm_broadcast_prompt"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings")],
-        [InlineKeyboardButton("📋 Tasks", callback_data="adm_tasks"),
-         InlineKeyboardButton("📢 Channels", callback_data="adm_channels")],
-    ])
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=buttons)
+    await update.message.reply_text(f"💰 *Your balance:* {user['balance']} coins\n\nEnter amount to withdraw (min: {min_withdraw}):", parse_mode='Markdown')
+    return WITHDRAW_AMOUNT
 
-async def admin_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    
-    if not context.args:
-        USER_STATES[user_id] = {'step': 'admin_broadcast'}
-        await update.message.reply_text(
-            "📣 <b>Broadcast</b>\n\nSend the message you want to broadcast to all users.\n(HTML formatting supported)\n\nSend /cancel to cancel.",
-            parse_mode='HTML', )
-        return
-    
-    msg = ' '.join(context.args)
-    query_db("INSERT INTO broadcast_queue (message) VALUES (?)", (msg,), commit=True)
-    await update.message.reply_text("✅ Broadcast queued! It will be sent shortly.", reply_markup=get_main_keyboard())
+async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text)
+        user_id = update.effective_user.id
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        user = c.fetchone()
+        conn.close()
+        
+        min_withdraw = float(get_setting('min_withdraw', '100'))
+        
+        if amount < min_withdraw:
+            await update.message.reply_text(f"❌ Minimum withdrawal is {min_withdraw} coins")
+            return WITHDRAW_AMOUNT
+        
+        if amount > user['balance']:
+            await update.message.reply_text(f"❌ Insufficient balance! You have {user['balance']} coins")
+            return WITHDRAW_AMOUNT
+        
+        context.user_data['withdraw_amount'] = amount
+        
+        keyboard = [
+            [KeyboardButton("🏦 Bank Transfer")],
+            [KeyboardButton("📱 UPI")],
+            [KeyboardButton("💳 Crypto")],
+            [KeyboardButton("❌ Cancel")]
+        ]
+        await update.message.reply_text("Select withdrawal method:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return WITHDRAW_METHOD
+        
+    except ValueError:
+        await update.message.reply_text("❌ Please enter a valid number")
+        return WITHDRAW_AMOUNT
 
-async def admin_pending_withdraws_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
+async def withdraw_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    method = update.message.text
     
-    reqs = query_db("SELECT * FROM withdraw_requests WHERE status='Pending' ORDER BY id DESC LIMIT 10")
-    if not reqs:
-        await update.message.reply_text("✅ No pending withdrawals.")
-        return
+    if method == "❌ Cancel":
+        await update.message.reply_text("❌ Withdrawal cancelled", reply_markup=get_main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
     
-    for w in reqs:
-        msg = (f"🆔 Withdraw ID: <b>{w['id']}</b>\n"
-               f"👤 User ID: <code>{w['user_id']}</code>\n"
-               f"💰 Amount: <b>{w['amount']}</b>\n"
-               f"💳 Method: {w['method']}\n"
-               f"📋 Details:\n{w['details']}\n"
-               f"📅 Date: {w['created_at']}")
-        markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"adm_approve_{w['id']}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"adm_reject_{w['id']}")
-        ]])
-        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=markup)
-
-async def admin_approve_withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /approve_withdraw [id]")
-        return
-    await _do_withdraw_action(update, context, int(context.args[0]), 'Approve')
-
-async def admin_reject_withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /reject_withdraw [id]")
-        return
-    await _do_withdraw_action(update, context, int(context.args[0]), 'Reject')
-
-async def _do_withdraw_action(update, context, req_id, action):
-    w = query_db("SELECT * FROM withdraw_requests WHERE id=?", (req_id,), one=True)
-    if not w:
-        await update.message.reply_text("❌ Withdrawal not found.")
-        return
-    if w['status'] != 'Pending':
-        await update.message.reply_text(f"⚠️ Already {w['status']}.")
-        return
+    context.user_data['withdraw_method'] = method
     
-    final_status = 'Approved' if action == 'Approve' else 'Rejected'
-    query_db("UPDATE withdraw_requests SET status=? WHERE id=?", (final_status, req_id), commit=True)
-    
-    if action == 'Approve':
-        text = f"✅ <b>Withdrawal Approved!</b>\nYour withdrawal of <b>{w['amount']} coins</b> has been processed."
-        send_telegram_message(w['user_id'], text)
-        await update.message.reply_text(f"✅ Withdrawal #{req_id} approved and user notified.")
+    if method == "🏦 Bank Transfer":
+        await update.message.reply_text("Enter *Bank Name:*", parse_mode='Markdown')
+        return WITHDRAW_BANK_NAME
+    elif method == "📱 UPI":
+        await update.message.reply_text("Enter your *UPI ID:*", parse_mode='Markdown')
+        return WITHDRAW_UPI
+    elif method == "💳 Crypto":
+        await update.message.reply_text("Enter your *Crypto Wallet Address:*\n(USDT TRC20/BEP20)", parse_mode='Markdown')
+        return WITHDRAW_CRYPTO
     else:
-        query_db("UPDATE users SET balance = balance + ? WHERE user_id=?", (w['amount'], w['user_id']), commit=True)
-        text = f"❌ <b>Withdrawal Rejected!</b>\n{w['amount']} coins refunded to your balance."
-        send_telegram_message(w['user_id'], text)
-        await update.message.reply_text(f"❌ Withdrawal #{req_id} rejected and coins refunded.")
+        await update.message.reply_text("❌ Please select a valid method")
+        return WITHDRAW_METHOD
 
-async def admin_set_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def withdraw_bank_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['bank_name'] = update.message.text
+    await update.message.reply_text("Enter *Account Number:*", parse_mode='Markdown')
+    return WITHDRAW_ACCOUNT_NO
+
+async def withdraw_account_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['account_no'] = update.message.text
+    await update.message.reply_text("Enter *IFSC Code:*", parse_mode='Markdown')
+    return WITHDRAW_IFSC
+
+async def withdraw_ifsc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['ifsc'] = update.message.text
+    await update.message.reply_text("Enter *Account Holder Name:*", parse_mode='Markdown')
+    return WITHDRAW_HOLDER
+
+async def withdraw_holder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /set_balance [user_id] [amount]")
-        return
-    target_id, amount = context.args[0], context.args[1]
-    query_db("UPDATE users SET balance=? WHERE user_id=?", (float(amount), int(target_id)), commit=True)
-    await update.message.reply_text(f"✅ Balance of user {target_id} set to {amount}.")
+    amount = context.user_data['withdraw_amount']
+    method = "Bank Transfer"
+    
+    details = f"Bank: {context.user_data['bank_name']}\nAccount: {context.user_data['account_no']}\nIFSC: {context.user_data['ifsc']}\nHolder: {update.message.text}"
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+    c.execute("INSERT INTO withdraw_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)", 
+             (user_id, amount, method, details))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ *Withdrawal Request Submitted!*\nAmount: {amount} coins\n\nWill be processed within 24-48 hours.", 
+                                   parse_mode='Markdown', reply_markup=get_main_keyboard(user_id))
+    
+    # Notify admins
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, f"💰 *New Withdrawal Request*\nUser: {user_id}\nAmount: {amount}\nMethod: {method}", parse_mode='Markdown')
+        except:
+            pass
+    
+    return ConversationHandler.END
 
-async def admin_block_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def withdraw_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /block_user [user_id]")
-        return
-    query_db("UPDATE users SET is_blocked=1 WHERE user_id=?", (int(context.args[0]),), commit=True)
-    await update.message.reply_text(f"🚫 User {context.args[0]} blocked.")
+    amount = context.user_data['withdraw_amount']
+    method = "UPI"
+    details = f"UPI ID: {update.message.text}"
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+    c.execute("INSERT INTO withdraw_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)", 
+             (user_id, amount, method, details))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ *Withdrawal Request Submitted!*\nAmount: {amount} coins", parse_mode='Markdown', reply_markup=get_main_keyboard(user_id))
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, f"💰 *New Withdrawal Request*\nUser: {user_id}\nAmount: {amount}\nMethod: UPI\nDetails: {update.message.text}", parse_mode='Markdown')
+        except:
+            pass
+    
+    return ConversationHandler.END
 
-async def admin_unblock_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def withdraw_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /unblock_user [user_id]")
-        return
-    query_db("UPDATE users SET is_blocked=0 WHERE user_id=?", (int(context.args[0]),), commit=True)
-    await update.message.reply_text(f"✅ User {context.args[0]} unblocked.")
+    amount = context.user_data['withdraw_amount']
+    method = "Crypto"
+    details = f"Wallet: {update.message.text}"
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+    c.execute("INSERT INTO withdraw_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)", 
+             (user_id, amount, method, details))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ *Withdrawal Request Submitted!*\nAmount: {amount} coins", parse_mode='Markdown', reply_markup=get_main_keyboard(user_id))
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, f"💰 *New Withdrawal Request*\nUser: {user_id}\nAmount: {amount}\nMethod: Crypto\nDetails: {update.message.text}", parse_mode='Markdown')
+        except:
+            pass
+    
+    return ConversationHandler.END
 
-async def admin_user_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /user_info [user_id]")
-        return
-    u = query_db("SELECT * FROM users WHERE user_id=?", (int(context.args[0]),), one=True)
-    if not u:
-        await update.message.reply_text("❌ User not found.")
-        return
-    tasks_done = query_db("SELECT COUNT(*) as c FROM user_tasks WHERE user_id=?", (u['user_id'],), one=True)['c']
-    msg = (f"👤 <b>User Info</b>\n\n"
-           f"🆔 ID: <code>{u['user_id']}</code>\n"
-           f"📛 Username: @{u['username'] or 'N/A'}\n"
-           f"💰 Balance: <b>{u['balance']}</b>\n"
-           f"👥 Referrals: {u['total_referrals']}\n"
-           f"📋 Tasks Done: {tasks_done}\n"
-           f"🚫 Blocked: {'Yes' if u['is_blocked'] else 'No'}\n"
-           f"📅 Joined: {u['join_date']}")
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚫 Block" if not u['is_blocked'] else "✅ Unblock",
-                             callback_data=f"adm_toggleblock_{u['user_id']}")
-    ]])
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=markup)
+async def withdraw_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Withdrawal cancelled", reply_markup=get_main_keyboard(update.effective_user.id))
+    return ConversationHandler.END
 
-async def admin_add_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /add_task [reward] [link] [title...]")
-        return
-    reward, link = context.args[0], context.args[1]
-    title = ' '.join(context.args[2:])
-    query_db("INSERT INTO tasks (title, reward, link, description) VALUES (?, ?, ?, ?)", (title, float(reward), link, ''), commit=True)
-    await update.message.reply_text(f"✅ Task '<b>{title}</b>' added with reward {reward}.", parse_mode='HTML')
-
-async def admin_list_tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    tasks = query_db("SELECT * FROM tasks ORDER BY id DESC")
-    if not tasks:
-        await update.message.reply_text("No tasks found.")
-        return
-    msg = "📋 <b>Tasks List:</b>\n\n"
-    for t in tasks:
-        status = "✅ Active" if t['is_active'] else "❌ Disabled"
-        msg += f"🆔 {t['id']} | {t['title']} | Reward: {t['reward']} | {status}\n"
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-async def admin_delete_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /delete_task [id]")
-        return
-    query_db("DELETE FROM tasks WHERE id=?", (int(context.args[0]),), commit=True)
-    await update.message.reply_text(f"🗑️ Task {context.args[0]} deleted.")
-
-async def admin_add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /add_channel [@channel_id or -100xxx] [link] [name...]")
-        return
-    channel_id, link = context.args[0], context.args[1]
-    name = ' '.join(context.args[2:])
-    query_db("INSERT INTO channels (channel_name, channel_link, channel_id) VALUES (?, ?, ?)", (name, link, channel_id), commit=True)
-    await update.message.reply_text(f"✅ Channel '<b>{name}</b>' added.", parse_mode='HTML')
-
-async def admin_list_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    channels = query_db("SELECT * FROM channels ORDER BY id DESC")
-    if not channels:
-        await update.message.reply_text("No channels found.")
-        return
-    msg = "📢 <b>Channels List:</b>\n\n"
-    for c in channels:
-        status = "✅ Active" if c['is_active'] else "❌ Disabled"
-        msg += f"🆔 {c['id']} | {c['channel_name']} | {c['channel_id']} | {status}\n"
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-async def admin_delete_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /delete_channel [id]")
-        return
-    query_db("DELETE FROM channels WHERE id=?", (int(context.args[0]),), commit=True)
-    await update.message.reply_text(f"🗑️ Channel {context.args[0]} deleted.")
-
-async def admin_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    rows = query_db("SELECT key, value FROM settings WHERE key IN ('referral_reward','daily_bonus','min_withdraw','force_join','welcome_message')")
-    msg = "⚙️ <b>Current Settings:</b>\n\n"
-    for r in rows:
-        msg += f"<b>{r['key']}</b>: {r['value']}\n"
-    msg += "\n📌 Use /set_setting [key] [value] to change.\nExample: /set_setting referral_reward 20"
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-async def admin_set_setting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id): return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /set_setting [key] [value]")
-        return
-    key, value = context.args[0], ' '.join(context.args[1:])
-    set_setting(key, value)
-    await update.message.reply_text(f"✅ Setting '<b>{key}</b>' updated to '<b>{value}</b>'.", parse_mode='HTML')
-
-async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin inline button callbacks"""
+# ==========================================
+# VERIFICATION CALLBACK
+# ==========================================
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
-    user_id = query.from_user.id
-    
-    if not data.startswith("adm_"):
-        return  # Not admin callback, ignore
-    
-    if not is_admin(user_id):
-        await query.answer("❌ Not authorized.", show_alert=True)
-        return
-    
     await query.answer()
     
-    if data == "adm_stats":
-        stats = {
-            'users': query_db("SELECT COUNT(*) as c FROM users", one=True)['c'],
-            'referrals': query_db("SELECT COUNT(*) as c FROM referrals", one=True)['c'],
-            'withdrawn': query_db("SELECT SUM(amount) as c FROM withdraw_requests WHERE status='Approved'", one=True)['c'] or 0,
-            'pending': query_db("SELECT COUNT(*) as c FROM withdraw_requests WHERE status='Pending'", one=True)['c'],
-        }
-        msg = (f"📊 <b>Live Stats</b>\n\n"
-               f"👥 Users: <b>{stats['users']}</b>\n"
-               f"🔗 Referrals: <b>{stats['referrals']}</b>\n"
-               f"💰 Withdrawn: <b>{stats['withdrawn']}</b>\n"
-               f"⏳ Pending: <b>{stats['pending']}</b>")
-        await query.message.reply_text(msg, parse_mode='HTML')
+    user_id = query.from_user.id
+    task_id = int(query.data.split("_")[1])
     
-    elif data == "adm_users":
-        users = query_db("SELECT * FROM users ORDER BY id DESC LIMIT 10")
-        msg = "👥 <b>Recent 10 Users:</b>\n\n"
-        for u in users:
-            status = "🚫" if u['is_blocked'] else "✅"
-            msg += f"{status} <code>{u['user_id']}</code> | @{u['username'] or 'N/A'} | {u['balance']} coins\n"
-        await query.message.reply_text(msg, parse_mode='HTML')
+    conn = get_db()
+    c = conn.cursor()
     
-    elif data == "adm_withdraws":
-        reqs = query_db("SELECT * FROM withdraw_requests WHERE status='Pending' ORDER BY id DESC LIMIT 5")
-        if not reqs:
-            await query.message.reply_text("✅ No pending withdrawals!")
-            return
-        for w in reqs:
-            msg = (f"🆔 ID: <b>{w['id']}</b> | 👤 <code>{w['user_id']}</code>\n"
-                   f"💰 Amount: <b>{w['amount']}</b> | 💳 {w['method']}\n"
-                   f"📋 {w['details']}")
-            markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"adm_approve_{w['id']}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"adm_reject_{w['id']}")
-            ]])
-            await query.message.reply_text(msg, parse_mode='HTML', reply_markup=markup)
+    c.execute("SELECT * FROM user_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
+    if c.fetchone():
+        await query.edit_message_text("❌ You have already completed this task!")
+        conn.close()
+        return
     
-    elif data == "adm_broadcast_prompt":
-        USER_STATES[user_id] = {'step': 'admin_broadcast'}
-        await query.message.reply_text(
-            "📣 Send the broadcast message now:\n(HTML formatting supported, /cancel to cancel)",
-            )
+    c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    task = c.fetchone()
     
-    elif data == "adm_settings":
-        rows = query_db("SELECT key, value FROM settings WHERE key IN ('referral_reward','daily_bonus','min_withdraw','force_join')")
-        msg = "⚙️ <b>Settings:</b>\n\n"
-        for r in rows:
-            msg += f"<b>{r['key']}</b>: {r['value']}\n"
-        msg += "\nUse /set_setting [key] [value] to change."
-        await query.message.reply_text(msg, parse_mode='HTML')
+    if task:
+        c.execute("INSERT INTO user_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
+        conn.commit()
+        
+        await query.edit_message_text(f"✅ *Task Verified!*\n+{task['reward']} coins added to your balance!", parse_mode='Markdown')
     
-    elif data == "adm_tasks":
-        tasks = query_db("SELECT * FROM tasks ORDER BY id DESC LIMIT 10")
-        if not tasks:
-            await query.message.reply_text("No tasks found. Use /add_task")
-            return
-        msg = "📋 <b>Tasks:</b>\n\n"
-        for t in tasks:
-            status = "✅" if t['is_active'] else "❌"
-            msg += f"{status} ID:{t['id']} | {t['title']} | {t['reward']} coins\n"
-        await query.message.reply_text(msg, parse_mode='HTML')
-    
-    elif data == "adm_channels":
-        channels = query_db("SELECT * FROM channels ORDER BY id DESC")
-        if not channels:
-            await query.message.reply_text("No channels. Use /add_channel")
-            return
-        msg = "📢 <b>Channels:</b>\n\n"
-        for c in channels:
-            status = "✅" if c['is_active'] else "❌"
-            msg += f"{status} ID:{c['id']} | {c['channel_name']} | {c['channel_id']}\n"
-        await query.message.reply_text(msg, parse_mode='HTML')
-    
-    elif data.startswith("adm_approve_"):
-        req_id = int(data.split("_")[2])
-        w = query_db("SELECT * FROM withdraw_requests WHERE id=?", (req_id,), one=True)
-        if not w or w['status'] != 'Pending':
-            await query.message.reply_text("⚠️ Already processed.")
-            return
-        query_db("UPDATE withdraw_requests SET status='Approved' WHERE id=?", (req_id,), commit=True)
-        send_telegram_message(w['user_id'], f"✅ <b>Withdrawal Approved!</b>\nYour {w['amount']} coins withdrawal has been processed.")
-        await query.message.reply_text(f"✅ Withdrawal #{req_id} approved!")
-    
-    elif data.startswith("adm_reject_"):
-        req_id = int(data.split("_")[2])
-        w = query_db("SELECT * FROM withdraw_requests WHERE id=?", (req_id,), one=True)
-        if not w or w['status'] != 'Pending':
-            await query.message.reply_text("⚠️ Already processed.")
-            return
-        query_db("UPDATE withdraw_requests SET status='Rejected' WHERE id=?", (req_id,), commit=True)
-        query_db("UPDATE users SET balance = balance + ? WHERE user_id=?", (w['amount'], w['user_id']), commit=True)
-        send_telegram_message(w['user_id'], f"❌ <b>Withdrawal Rejected!</b>\n{w['amount']} coins refunded to your balance.")
-        await query.message.reply_text(f"❌ Withdrawal #{req_id} rejected, coins refunded.")
-    
-    elif data.startswith("adm_toggleblock_"):
-        target_id = int(data.split("_")[2])
-        u = query_db("SELECT is_blocked FROM users WHERE user_id=?", (target_id,), one=True)
-        new_status = 0 if u and u['is_blocked'] else 1
-        query_db("UPDATE users SET is_blocked=? WHERE user_id=?", (new_status, target_id), commit=True)
-        action = "Blocked" if new_status else "Unblocked"
-        await query.message.reply_text(f"{'🚫' if new_status else '✅'} User {target_id} {action}.")
+    conn.close()
 
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if await check_force_join(update, context):
+        await query.message.delete()
+        await context.bot.send_message(query.from_user.id, "✅ Thank you for joining! You can now use the bot.", reply_markup=get_main_keyboard(query.from_user.id))
+    else:
+        await query.answer("Please join all channels first!", show_alert=True)
+
+# ==========================================
+# ADMIN PANEL (IN-BOT)
+# ==========================================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You are not an admin!")
+        return
+    
+    await update.message.reply_text("⚙️ *Admin Panel*\nSelect an option:", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    await update.message.reply_text("📢 *Send Broadcast Message*\n\nSend me the message you want to broadcast to ALL users.\n(Supports HTML formatting)\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_BROADCAST
+
+async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Broadcast cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    msg = update.message.text
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text("⏳ Sending broadcast message to all users...")
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE is_blocked = 0")
+    users = c.fetchall()
+    conn.close()
+    
+    success = 0
+    failed = 0
+    
+    for user in users:
+        try:
+            await context.bot.send_message(user['user_id'], msg, parse_mode='HTML')
+            success += 1
+            await asyncio.sleep(0.05)  # Avoid flood limit
+        except:
+            failed += 1
+    
+    await update.message.reply_text(f"✅ *Broadcast Complete*\n\nSent: {success}\nFailed: {failed}\n\nTotal users: {len(users)}", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+    
+    return ConversationHandler.END
+
+async def admin_add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    await update.message.reply_text("➕ *Add New Task*\n\nSend me the task details in this format:\n\n`Title|Description|Reward|Link`\n\nExample:\n`Follow on Twitter|Follow our Twitter|15|https://twitter.com/xxx`\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_ADD_TASK
+
+async def admin_add_task_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        parts = update.message.text.split("|")
+        if len(parts) != 4:
+            await update.message.reply_text("❌ Invalid format! Use: `Title|Description|Reward|Link`", parse_mode='Markdown')
+            return ADMIN_ADD_TASK
+        
+        title, description, reward, link = parts
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO tasks (title, description, reward, link) VALUES (?, ?, ?, ?)", 
+                 (title.strip(), description.strip(), float(reward), link.strip()))
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(f"✅ *Task Added Successfully!*\n\nTitle: {title}\nReward: {reward} coins", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        return ADMIN_ADD_TASK
+    
+    return ConversationHandler.END
+
+async def admin_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM tasks ORDER BY id DESC")
+    tasks = c.fetchall()
+    conn.close()
+    
+    if not tasks:
+        await update.message.reply_text("📋 No tasks found!")
+        return
+    
+    msg = "📋 *All Tasks*\n\n"
+    for task in tasks:
+        status = "🟢 Active" if task['is_active'] else "🔴 Disabled"
+        msg += f"*ID {task['id']}:* {task['title']}\n"
+        msg += f"💰 {task['reward']} coins | {status}\n"
+        msg += f"🔗 {task['link']}\n\n"
+    
+    msg += "\nTo toggle/delete tasks, use:\n/toggle_task <id>\n/delete_task <id>"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def admin_add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    await update.message.reply_text("➕ *Add Force-Join Channel*\n\nSend me channel details in this format:\n\n`Name|Link|Chat_ID`\n\nExample:\n`My Channel|https://t.me/mychannel|@mychannel`\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_ADD_CHANNEL
+
+async def admin_add_channel_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        parts = update.message.text.split("|")
+        if len(parts) != 3:
+            await update.message.reply_text("❌ Invalid format! Use: `Name|Link|Chat_ID`", parse_mode='Markdown')
+            return ADMIN_ADD_CHANNEL
+        
+        name, link, chat_id = parts
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO channels (name, link, chat_id) VALUES (?, ?, ?)", 
+                 (name.strip(), link.strip(), chat_id.strip()))
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(f"✅ *Channel Added!*\n\nName: {name}\nChat ID: {chat_id}", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        return ADMIN_ADD_CHANNEL
+    
+    return ConversationHandler.END
+
+async def admin_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) as count FROM users")
+    total_users = c.fetchone()['count']
+    
+    c.execute("SELECT COUNT(*) as count FROM users WHERE is_blocked = 1")
+    blocked_users = c.fetchone()['count']
+    
+    c.execute("SELECT COUNT(*) as count FROM referrals")
+    total_refs = c.fetchone()['count']
+    
+    c.execute("SELECT SUM(amount) as total FROM withdraw_requests WHERE status = 'approved'")
+    total_withdrawn = c.fetchone()['total'] or 0
+    
+    c.execute("SELECT COUNT(*) as count FROM withdraw_requests WHERE status = 'pending'")
+    pending_withdraws = c.fetchone()['count']
+    
+    c.execute("SELECT SUM(balance) as total FROM users")
+    total_balance = c.fetchone()['total'] or 0
+    
+    c.execute("SELECT COUNT(*) as count FROM tasks WHERE is_active = 1")
+    active_tasks = c.fetchone()['count']
+    
+    conn.close()
+    
+    msg = f"📊 *Bot Statistics*\n\n"
+    msg += f"👥 Total Users: {total_users}\n"
+    msg += f"🚫 Blocked Users: {blocked_users}\n"
+    msg += f"👥 Total Referrals: {total_refs}\n"
+    msg += f"💰 Total Balance in Bot: {total_balance:.2f} coins\n"
+    msg += f"💸 Total Withdrawn: {total_withdrawn:.2f} coins\n"
+    msg += f"⏳ Pending Withdrawals: {pending_withdraws}\n"
+    msg += f"📋 Active Tasks: {active_tasks}\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def admin_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, balance, total_referrals, is_blocked FROM users ORDER BY balance DESC LIMIT 50")
+    users = c.fetchall()
+    conn.close()
+    
+    if not users:
+        await update.message.reply_text("No users found!")
+        return
+    
+    msg = "👥 *Top 50 Users by Balance*\n\n"
+    for i, user in enumerate(users, 1):
+        name = user['username'] or f"ID:{user['user_id']}"
+        status = "🔴" if user['is_blocked'] else "🟢"
+        msg += f"{i}. {status} {name[:20]} - 💰{user['balance']} | 👥{user['total_referrals']}\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def admin_withdraw_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM withdraw_requests WHERE status = 'pending' ORDER BY created_at ASC")
+    requests = c.fetchall()
+    conn.close()
+    
+    if not requests:
+        await update.message.reply_text("📭 No pending withdrawal requests!")
+        return
+    
+    for req in requests:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{req['id']}"),
+             InlineKeyboardButton("❌ Reject", callback_data=f"reject_{req['id']}")]
+        ])
+        
+        msg = f"💰 *Withdrawal Request #{req['id']}*\n\n"
+        msg += f"👤 User ID: `{req['user_id']}`\n"
+        msg += f"💸 Amount: {req['amount']} coins\n"
+        msg += f"🏦 Method: {req['method']}\n"
+        msg += f"📝 Details:\n`{req['details']}`\n"
+        msg += f"📅 Requested: {req['created_at']}"
+        
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
+
+async def admin_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    action, req_id = query.data.split("_")
+    req_id = int(req_id)
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM withdraw_requests WHERE id = ?", (req_id,))
+    req = c.fetchone()
+    
+    if not req:
+        await query.edit_message_text("❌ Request not found!")
+        conn.close()
+        return
+    
+    if action == "approve":
+        c.execute("UPDATE withdraw_requests SET status = 'approved' WHERE id = ?", (req_id,))
+        msg = f"✅ *Withdrawal Approved!*\n\nAmount: {req['amount']} coins\n\nYour withdrawal has been processed successfully!"
+        
+    else:  # reject
+        c.execute("UPDATE withdraw_requests SET status = 'rejected' WHERE id = ?", (req_id,))
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (req['amount'], req['user_id']))
+        msg = f"❌ *Withdrawal Rejected!*\n\nAmount: {req['amount']} coins\n\nYour withdrawal was rejected. Amount has been refunded to your balance."
+    
+    conn.commit()
+    conn.close()
+    
+    await query.edit_message_text(f"✅ Request #{req_id} {action}ed!")
+    
+    # Notify user
+    try:
+        await context.bot.send_message(req['user_id'], msg, parse_mode='Markdown')
+    except:
+        pass
+
+async def admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    reward = get_setting('referral_reward', '10')
+    daily = get_setting('daily_bonus', '5')
+    min_w = get_setting('min_withdraw', '100')
+    force_join = "ON" if get_setting('force_join') == '1' else "OFF"
+    
+    keyboard = [
+        [InlineKeyboardButton(f"💰 Referral Reward: {reward}", callback_data="set_reward")],
+        [InlineKeyboardButton(f"🎁 Daily Bonus: {daily}", callback_data="set_daily")],
+        [InlineKeyboardButton(f"💳 Min Withdraw: {min_w}", callback_data="set_minwithdraw")],
+        [InlineKeyboardButton(f"🔒 Force Join: {force_join}", callback_data="toggle_forcejoin")],
+        [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+    ]
+    
+    await update.message.reply_text("⚙️ *Bot Settings*\n\nClick on any setting to change it:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_set_reward_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("💰 *Set Referral Reward*\n\nEnter the amount (in coins) users will get per referral:\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_SET_REWARD
+
+async def admin_set_reward_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        value = float(update.message.text)
+        set_setting('referral_reward', str(value))
+        await update.message.reply_text(f"✅ Referral reward set to *{value}* coins!", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+    except:
+        await update.message.reply_text("❌ Please enter a valid number!")
+        return ADMIN_SET_REWARD
+    
+    return ConversationHandler.END
+
+async def admin_set_daily_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎁 *Set Daily Bonus*\n\nEnter the amount (in coins) for daily bonus:\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_SET_DAILY
+
+async def admin_set_daily_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        value = float(update.message.text)
+        set_setting('daily_bonus', str(value))
+        await update.message.reply_text(f"✅ Daily bonus set to *{value}* coins!", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+    except:
+        await update.message.reply_text("❌ Please enter a valid number!")
+        return ADMIN_SET_DAILY
+    
+    return ConversationHandler.END
+
+async def admin_set_minwithdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("💳 *Set Minimum Withdrawal*\n\nEnter the minimum amount (in coins) required to withdraw:\n\nSend /cancel to cancel.", parse_mode='Markdown')
+    return ADMIN_SET_MINWITHDRAW
+
+async def admin_set_minwithdraw_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/cancel":
+        await update.message.reply_text("❌ Cancelled", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        value = float(update.message.text)
+        set_setting('min_withdraw', str(value))
+        await update.message.reply_text(f"✅ Minimum withdrawal set to *{value}* coins!", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+    except:
+        await update.message.reply_text("❌ Please enter a valid number!")
+        return ADMIN_SET_MINWITHDRAW
+    
+    return ConversationHandler.END
+
+async def admin_toggle_forcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    current = get_setting('force_join', '1')
+    new = '0' if current == '1' else '1'
+    set_setting('force_join', new)
+    
+    status = "ON" if new == '1' else "OFF"
+    await query.edit_message_text(f"✅ Force Join turned {status}!")
+    await asyncio.sleep(1)
+    
+    # Go back to settings menu
+    reward = get_setting('referral_reward', '10')
+    daily = get_setting('daily_bonus', '5')
+    min_w = get_setting('min_withdraw', '100')
+    force_join = "ON" if get_setting('force_join') == '1' else "OFF"
+    
+    keyboard = [
+        [InlineKeyboardButton(f"💰 Referral Reward: {reward}", callback_data="set_reward")],
+        [InlineKeyboardButton(f"🎁 Daily Bonus: {daily}", callback_data="set_daily")],
+        [InlineKeyboardButton(f"💳 Min Withdraw: {min_w}", callback_data="set_minwithdraw")],
+        [InlineKeyboardButton(f"🔒 Force Join: {force_join}", callback_data="toggle_forcejoin")],
+        [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+    ]
+    
+    await context.bot.send_message(query.from_user.id, "⚙️ *Bot Settings*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.delete()
+    await context.bot.send_message(query.from_user.id, "⚙️ *Admin Panel*", parse_mode='Markdown', reply_markup=get_admin_keyboard())
+
+async def admin_back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text("◀️ Back to main menu", reply_markup=get_main_keyboard(user_id))
+
+# ==========================================
+# MAIN
+# ==========================================
+async def post_init(application: Application):
+    logger.info("Bot started successfully!")
 
 def main():
-    logger.info(f"Starting Flask Server in Background Thread on Port {FLASK_PORT}...")
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    logger.info("Initializing Telegram Bot...")
-    token = get_setting('bot_token')
+    # Start webhook for Render (keep-alive)
+    from telegram.ext import Updater
+    import threading
     
-    if not token or token.strip() == "":
-        token = BOT_TOKEN
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
+    # Force join check middleware
+    # Handled in message handlers
+    
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    
+    # Admin task management commands
+    app.add_handler(CommandHandler("toggle_task", admin_toggle_task_command))
+    app.add_handler(CommandHandler("delete_task", admin_delete_task_command))
+    
+    # Message handlers
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^👤 Profile$"), profile))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^💰 Balance$"), balance))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^👥 Referrals$"), referrals))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🎁 Daily Bonus$"), daily_bonus))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 Tasks$"), tasks))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🏆 Leaderboard$"), leaderboard))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^ℹ️ Help$"), help_command))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Admin Panel$"), admin_panel))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^◀️ Back to Main$"), admin_back_to_main))
+    
+    # Admin panel handlers
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📢 Broadcast$"), admin_broadcast_start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^➕ Add Task$"), admin_add_task_start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 All Tasks$"), admin_all_tasks))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^➕ Add Channel$"), admin_add_channel_start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Statistics$"), admin_statistics))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^👥 All Users$"), admin_all_users))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^💳 Withdraw Requests$"), admin_withdraw_requests))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Settings$"), admin_settings_menu))
+    
+    # Withdrawal conversation
+    withdraw_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^💳 Withdraw$"), withdraw_start)],
+        states={
+            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
+            WITHDRAW_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_method)],
+            WITHDRAW_BANK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_bank_name)],
+            WITHDRAW_ACCOUNT_NO: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_account_no)],
+            WITHDRAW_IFSC: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_ifsc)],
+            WITHDRAW_HOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_holder)],
+            WITHDRAW_UPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_upi)],
+            WITHDRAW_CRYPTO: [MessageHandler(filters.TEXT & ~fILTERS.COMMAND, withdraw_crypto)],
+        },
+        fallbacks=[MessageHandler(filters.TEXT & filters.Regex("^❌ Cancel$"), withdraw_cancel)],
+    )
+    app.add_handler(withdraw_conv)
+    
+    # Admin setting conversations
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_set_reward_start, pattern="^set_reward$")],
+        states={ADMIN_SET_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_reward_save)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_set_daily_start, pattern="^set_daily$")],
+        states={ADMIN_SET_DAILY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_daily_save)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_set_minwithdraw_start, pattern="^set_minwithdraw$")],
+        states={ADMIN_SET_MINWITHDRAW: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_minwithdraw_save)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    
+    # Admin broadcast conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📢 Broadcast$"), admin_broadcast_start)],
+        states={ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    
+    # Admin add task conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^➕ Add Task$"), admin_add_task_start)],
+        states={ADMIN_ADD_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_task_save)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    
+    # Admin add channel conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^➕ Add Channel$"), admin_add_channel_start)],
+        states={ADMIN_ADD_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_channel_save)]},
+        fallbacks=[CommandHandler("cancel", admin_back_to_main)],
+    ))
+    
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_"))
+    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
+    app.add_handler(CallbackQueryHandler(admin_withdraw_action, pattern="^(approve|reject)_"))
+    app.add_handler(CallbackQueryHandler(admin_toggle_forcejoin, pattern="^toggle_forcejoin$"))
+    app.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
+    
+    # Simple web server for Render keep-alive
+    def run_web():
+        from flask import Flask
+        web = Flask(__name__)
         
-    application = Application.builder().token(token).build()
-
-    application.add_handler(TypeHandler(Update, check_force_join), group=-1)
-
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("cancel", cancel_cmd))
+        @web.route('/')
+        def index():
+            return "Bot is running!", 200
+        
+        @web.route('/ping')
+        def ping():
+            return "OK", 200
+        
+        web.run(host='0.0.0.0', port=PORT)
     
-    # Admin Commands
-    application.add_handler(CommandHandler("admin", admin_cmd))
-    application.add_handler(CommandHandler("broadcast", admin_broadcast_cmd))
-    application.add_handler(CommandHandler("pending_withdraws", admin_pending_withdraws_cmd))
-    application.add_handler(CommandHandler("approve_withdraw", admin_approve_withdraw_cmd))
-    application.add_handler(CommandHandler("reject_withdraw", admin_reject_withdraw_cmd))
-    application.add_handler(CommandHandler("set_balance", admin_set_balance_cmd))
-    application.add_handler(CommandHandler("block_user", admin_block_user_cmd))
-    application.add_handler(CommandHandler("unblock_user", admin_unblock_user_cmd))
-    application.add_handler(CommandHandler("user_info", admin_user_info_cmd))
-    application.add_handler(CommandHandler("add_task", admin_add_task_cmd))
-    application.add_handler(CommandHandler("list_tasks", admin_list_tasks_cmd))
-    application.add_handler(CommandHandler("delete_task", admin_delete_task_cmd))
-    application.add_handler(CommandHandler("add_channel", admin_add_channel_cmd))
-    application.add_handler(CommandHandler("list_channels", admin_list_channels_cmd))
-    application.add_handler(CommandHandler("delete_channel", admin_delete_channel_cmd))
-    application.add_handler(CommandHandler("settings", admin_settings_cmd))
-    application.add_handler(CommandHandler("set_setting", admin_set_setting_cmd))
-
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    threading.Thread(target=run_web, daemon=True).start()
+    logger.info(f"Web server running on port {PORT}")
     
-    # Admin callbacks (group 1 - higher priority for adm_ prefixed callbacks)
-    application.add_handler(CallbackQueryHandler(admin_handle_callback, pattern="^adm_"), group=1)
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    # Start bot
+    logger.info("Starting bot...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(broadcast_job, interval=10, first=5)
+async def admin_toggle_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You are not admin!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /toggle_task <task_id>")
+        return
+    
+    task_id = int(context.args[0])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ Task {task_id} toggled!")
 
-    logger.info("Bot is running...")
-    application.run_polling()
+async def admin_delete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You are not admin!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /delete_task <task_id>")
+        return
+    
+    task_id = int(context.args[0])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    c.execute("DELETE FROM user_tasks WHERE task_id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ Task {task_id} deleted!")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
