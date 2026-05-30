@@ -15,7 +15,7 @@ from telegram.error import TelegramError
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN = "8273026626:AAFIcN-Esy0ZUnFr29LSiEDlrYAcnvKqnHg"
+BOT_TOKEN = "8683291034:AAEW0PAFMWpFrP-cbjFCBFm8Q2_zABv7Wds"
 ADMIN_IDS = [6106058051]  # Multiple admins support
 
 DB_FILE = os.environ.get("DB_FILE", "bot_database.db")
