@@ -16,7 +16,7 @@ from telegram.ext import (
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN         = "8273026626:AAFIcN-Esy0ZUnFr29LSiEDlrYAcnvKqnHg"
+BOT_TOKEN         = "8628089455:AAGEIZ9KCL_1_aoIhr_J3ImcaQO3ubBak7o"
 ADMIN_TELEGRAM_ID = 6106058051
 
 DEFAULT_REFERRAL_REWARD = 10
