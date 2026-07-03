@@ -1,5 +1,0 @@
-flask
-jinja2
-werkzeug
-requests
-python-telegram-bot[job-queue]==22.8
